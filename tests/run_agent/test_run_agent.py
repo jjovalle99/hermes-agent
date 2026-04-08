@@ -872,6 +872,52 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["max_tokens"] == 4096
 
+    def test_qwen_portal_formats_messages_and_metadata(self, agent):
+        agent.base_url = "https://portal.qwen.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.session_id = "sess-123"
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "assistant", "content": "Got it"},
+            {"role": "user", "content": "hi"},
+        ]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["metadata"]["sessionId"] == "sess-123"
+        assert kwargs["extra_body"]["vl_high_resolution_images"] is True
+        assert isinstance(kwargs["messages"][0]["content"], list)
+        assert kwargs["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert kwargs["messages"][2]["content"][0]["text"] == "hi"
+
+    def test_qwen_portal_normalizes_bare_string_content_parts(self, agent):
+        agent.base_url = "https://portal.qwen.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": "system"}]},
+            {"role": "user", "content": ["hello", {"type": "text", "text": "world"}]},
+        ]
+        kwargs = agent._build_api_kwargs(messages)
+        user_content = kwargs["messages"][1]["content"]
+        assert user_content[0] == {"type": "text", "text": "hello"}
+        assert user_content[1] == {"type": "text", "text": "world"}
+
+    def test_qwen_portal_no_system_message(self, agent):
+        agent.base_url = "https://portal.qwen.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        # Should not crash even without a system message
+        assert kwargs["messages"][0]["content"][0]["text"] == "hi"
+        assert "cache_control" not in kwargs["messages"][0]["content"][0]
+
+    def test_qwen_portal_omits_max_tokens(self, agent):
+        agent.base_url = "https://portal.qwen.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.max_tokens = 4096
+        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert "max_tokens" not in kwargs
+        assert "max_completion_tokens" not in kwargs
+
 
 class TestBuildAssistantMessage:
     def test_basic_message(self, agent):
@@ -1011,10 +1057,9 @@ class TestExecuteToolCalls:
         big_result = "x" * 150_000
         with patch("run_agent.handle_function_call", return_value=big_result):
             agent._execute_tool_calls(mock_msg, messages, "task-1")
-        # Content should be replaced with preview + file path
+        # Content should be replaced with persisted-output or truncation
         assert len(messages[0]["content"]) < 150_000
-        assert "Large tool response" in messages[0]["content"]
-        assert "Full output saved to:" in messages[0]["content"]
+        assert ("Truncated" in messages[0]["content"] or "<persisted-output>" in messages[0]["content"])
 
 
 class TestConcurrentToolExecution:
@@ -1249,8 +1294,7 @@ class TestConcurrentToolExecution:
         assert len(messages) == 2
         for m in messages:
             assert len(m["content"]) < 150_000
-            assert "Large tool response" in m["content"]
-            assert "Full output saved to:" in m["content"]
+            assert ("Truncated" in m["content"] or "<persisted-output>" in m["content"])
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
@@ -1547,7 +1591,7 @@ class TestRunConversation:
         assert any(m.get("reasoning") for m in assistant_msgs)
 
     def test_reasoning_only_local_resumed_no_compression_triggered(self, agent):
-        """Reasoning-only responses no longer trigger compression — accepted immediately."""
+        """Reasoning-only responses no longer trigger compression — prefill then accepted."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
         agent.compression_enabled = True
@@ -1561,8 +1605,9 @@ class TestRunConversation:
             {"role": "assistant", "content": "old answer"},
         ]
 
+        # 3 responses: original + 2 prefill continuations (structured reasoning triggers prefill)
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp]),
+            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp, empty_resp, empty_resp]),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1573,17 +1618,18 @@ class TestRunConversation:
         mock_compress.assert_not_called()  # no compression triggered
         assert result["completed"] is True
         assert result["final_response"] == "(empty)"
-        assert result["api_calls"] == 1
+        assert result["api_calls"] == 3  # 1 original + 2 prefill continuations
 
-    def test_reasoning_only_response_accepted_without_retry(self, agent):
-        """Reasoning-only response should be accepted with (empty) content, no retries."""
+    def test_reasoning_only_response_prefill_then_empty(self, agent):
+        """Structured reasoning-only triggers prefill continuation (up to 2), then falls through to (empty)."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
             content=None,
             finish_reason="stop",
             reasoning_content="structured reasoning answer",
         )
-        agent.client.chat.completions.create.side_effect = [empty_resp]
+        # 3 responses: original + 2 prefill continuations, all reasoning-only
+        agent.client.chat.completions.create.side_effect = [empty_resp, empty_resp, empty_resp]
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1592,7 +1638,35 @@ class TestRunConversation:
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
         assert result["final_response"] == "(empty)"
-        assert result["api_calls"] == 1  # no retries
+        assert result["api_calls"] == 3  # 1 original + 2 prefill continuations
+
+    def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):
+        """When prefill continuation produces content, it becomes the final response."""
+        self._setup_agent(agent)
+        empty_resp = _mock_response(
+            content=None,
+            finish_reason="stop",
+            reasoning_content="structured reasoning answer",
+        )
+        content_resp = _mock_response(
+            content="Here is the actual answer.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [empty_resp, content_resp]
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+        assert result["completed"] is True
+        assert result["final_response"] == "Here is the actual answer."
+        assert result["api_calls"] == 2  # 1 original + 1 prefill continuation
+        # Prefill message should be cleaned up — no consecutive assistant messages
+        roles = [m.get("role") for m in result["messages"]]
+        for i in range(len(roles) - 1):
+            if roles[i] == "assistant" and roles[i + 1] == "assistant":
+                raise AssertionError("Consecutive assistant messages found in history")
 
     def test_truly_empty_response_accepted_without_retry(self, agent):
         """Truly empty response (no content, no reasoning) should still complete with (empty)."""

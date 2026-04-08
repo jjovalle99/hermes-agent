@@ -389,7 +389,7 @@ DEFAULT_CONFIG = {
     
     # Text-to-speech configuration
     "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "neutts" (local)
+        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "minimax" | "mistral" | "neutts" (local)
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
@@ -402,6 +402,10 @@ DEFAULT_CONFIG = {
             "model": "gpt-4o-mini-tts",
             "voice": "alloy",
             # Voices: alloy, echo, fable, onyx, nova, shimmer
+        },
+        "mistral": {
+            "model": "voxtral-mini-tts-2603",
+            "voice_id": "c69964a6-ab8b-4f8a-9465-ec0925096ec8",  # Paul - Neutral
         },
         "neutts": {
             "ref_audio": "",  # Path to reference voice audio (empty = bundled default)
@@ -416,6 +420,7 @@ DEFAULT_CONFIG = {
         "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe)
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "openai": {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
@@ -726,6 +731,14 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "HERMES_QWEN_BASE_URL": {
+        "description": "Qwen Portal base URL override (default: https://portal.qwen.ai/v1)",
+        "prompt": "Qwen Portal base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
     "OPENCODE_ZEN_API_KEY": {
         "description": "OpenCode Zen API key (pay-as-you-go access to curated models)",
         "prompt": "OpenCode Zen API key",
@@ -922,6 +935,13 @@ OPTIONAL_ENV_VARS = {
         "description": "ElevenLabs API key for premium text-to-speech voices",
         "prompt": "ElevenLabs API key",
         "url": "https://elevenlabs.io/",
+        "password": True,
+        "category": "tool",
+    },
+    "MISTRAL_API_KEY": {
+        "description": "Mistral API key for Voxtral TTS and transcription (STT)",
+        "prompt": "Mistral API key",
+        "url": "https://console.mistral.ai/",
         "password": True,
         "category": "tool",
     },
@@ -1882,6 +1902,24 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     config.pop("max_turns", None)
     return config
 
+
+
+def read_raw_config() -> Dict[str, Any]:
+    """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
+
+    Returns the raw YAML dict, or ``{}`` if the file doesn't exist or can't
+    be parsed.  Use this for lightweight config reads where you just need a
+    single value and don't want the overhead of ``load_config()``'s deep-merge
+    + migration pipeline.
+    """
+    try:
+        config_path = get_config_path()
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+    except Exception:
+        pass
+    return {}
 
 
 def load_config() -> Dict[str, Any]:

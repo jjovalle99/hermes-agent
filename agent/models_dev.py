@@ -153,6 +153,7 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "minimax-cn": "minimax-cn",
     "deepseek": "deepseek",
     "alibaba": "alibaba",
+    "qwen-oauth": "alibaba",
     "copilot": "github-copilot",
     "ai-gateway": "vercel",
     "opencode-zen": "opencode",
@@ -185,9 +186,8 @@ def _get_reverse_mapping() -> Dict[str, str]:
 
 def _get_cache_path() -> Path:
     """Return path to disk cache file."""
-    env_val = os.environ.get("HERMES_HOME", "")
-    hermes_home = Path(env_val) if env_val else Path.home() / ".hermes"
-    return hermes_home / "models_dev_cache.json"
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "models_dev_cache.json"
 
 
 def _load_disk_cache() -> Dict[str, Any]:
